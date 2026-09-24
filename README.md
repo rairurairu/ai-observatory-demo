@@ -2,7 +2,19 @@
 
 **LLM Brand Recommendation Intelligence Platform** · Research demonstration platform
 
+[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+
 AI Observatory is a local research prototype for running controlled prompt/model experiments, preserving raw responses, extracting brand observations, and reviewing descriptive trends. The default dataset is deterministic, synthetic, and labeled as demo data. It does not represent actual measurements from ChatGPT, Claude, Gemini, or another commercial model.
+
+## Screenshots
+
+![AI Observatory overview with the synthetic demo dataset](docs/images/overview.png)
+
+*Overview — synthetic demonstration data, clearly labeled as simulated.*
+
+![Experiment Lab showing live API comparison and experiment history](docs/images/experiment-history.png)
+
+*Experiment Lab — saved live runs and failed or excluded attempts remain visible in the history.*
 
 ## Architecture
 
@@ -71,6 +83,14 @@ python scripts\reset_demo_data.py
 ```
 
 For a clean reset of IDs/schema, remove `ai_observatory.db`, then rerun initialization and generation. The API itself will seed demo data on first startup if the database is empty.
+
+## Prompt for a coding agent
+
+Copy this prompt into your coding agent if you want it to clone and run the demo locally:
+
+```text
+Clone https://github.com/rairurairu/ai-observatory-demo.git and help me run AI Observatory locally. Read README.md first and follow its setup steps. Keep the bundled ai_observatory.db experiment history intact. Use demo mode; do not read, print, copy, or upload any .env file or API key. Do not run paid/live experiments, reset the database, or push changes. Start the backend and frontend, then tell me the local URL and how to stop both servers.
+```
 
 ## Five-minute demonstration
 
