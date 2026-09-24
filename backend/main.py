@@ -8,12 +8,14 @@ from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
 from backend.database import get_db
 from backend.models import Annotation, Brand, BrandAlias, BrandObservation, ExecutionLog, Experiment, ExperimentRun, ExtractionRun, LLMResponse, Model, Prompt
-from backend.services import init_db, seed_demo, demo_run, live_run, response_dict, analytics, DOMAINS, uid
+from backend.services import init_db, seed_demo, seed_reference_catalog, demo_run, live_run, response_dict, analytics, DOMAINS, uid
 from backend.llm_adapters import available_live_models, configured_providers, ADAPTERS
+from backend.config import APP_MODE
 
 @asynccontextmanager
 async def lifespan(_app):
-    init_db(); seed_demo()
+    init_db(); seed_reference_catalog()
+    if APP_MODE=="demo": seed_demo()
     yield
 
 app=FastAPI(title="AI Observatory API",description="Research platform for studying brand recommendations. Demo observations are synthetic.",version="1.0.0",lifespan=lifespan)
@@ -23,7 +25,7 @@ class PromptIn(BaseModel): text:str=Field(min_length=8,max_length=1000); domain:
 class ExperimentIn(BaseModel):
     name:str=Field(min_length=2,max_length=200); description:str=""; domain:str
     model_ids:list[str]=Field(min_length=1); prompt_ids:list[str]=Field(min_length=1); repetitions:int=Field(default=1,ge=1,le=50)
-    mode:str="demo"; search_enabled:bool=False
+    mode:str="live"; search_enabled:bool=False
 class AnnotationIn(BaseModel): observation_id:str; sentiment:str|None=None; rank:int|None=None; note:str=""
 class RunIn(BaseModel): confirm_live_cost_unavailable:bool=False
 class BrandAliasesIn(BaseModel): aliases:list[str]=Field(max_length=40)
@@ -31,11 +33,11 @@ class BrandAliasesIn(BaseModel): aliases:list[str]=Field(max_length=40)
 @app.get("/health")
 def health(db:Session=Depends(get_db)): return {"status":"ok","database":"connected","responses":db.scalar(select(func.count(LLMResponse.id))) or 0}
 @app.get("/api/overview")
-def overview(source:str="demo",domain:str|None=None,model:str|None=None,start:datetime|None=None,end:datetime|None=None,brand_id:str|None=None,db:Session=Depends(get_db)):
+def overview(source:str="live",domain:str|None=None,model:str|None=None,start:datetime|None=None,end:datetime|None=None,brand_id:str|None=None,db:Session=Depends(get_db)):
     return analytics(db,source,domain,model,start,end,brand_id)
 @app.get("/api/domains")
 def domains(db:Session=Depends(get_db)):
-    return [{"name":name,"brand_count":db.scalar(select(func.count(Brand.id)).where(Brand.domain==name)) or 0,"prompt_count":db.scalar(select(func.count(Prompt.id)).where(Prompt.domain==name)) or 0} for name in DOMAINS]
+    return [{"name":name,"brand_count":db.scalar(select(func.count(Brand.id)).where(Brand.domain==name)) or 0,"prompt_count":db.scalar(select(func.count(Prompt.id)).where(Prompt.domain==name,Prompt.is_custom==True)) or 0} for name in DOMAINS]
 @app.get("/api/brands")
 def brands(domain:str|None=None,db:Session=Depends(get_db)):
     q=select(Brand).order_by(Brand.domain,Brand.canonical_name)
@@ -53,22 +55,22 @@ def update_aliases(brand_id:str,body:BrandAliasesIn,db:Session=Depends(get_db)):
     db.commit()
     return {"id":b.id,"name":b.canonical_name,"aliases":b.aliases,"note":"Historical raw responses and extraction rows were preserved."}
 @app.get("/api/models")
-def models(mode:str="demo",db:Session=Depends(get_db)):
-    if mode=="demo": return [{"id":m.id,"name":m.display_name,"provider":m.provider,"data_source":m.data_source} for m in db.scalars(select(Model).where(Model.data_source=="demo").order_by(Model.display_name))]
-    if mode!="live":raise HTTPException(400,"Mode must be demo or live")
-    available=[]
+def models(mode:str|None=None,db:Session=Depends(get_db)):
+    mode=mode or APP_MODE
+    if mode=="demo" and APP_MODE=="demo": return [{"id":m.id,"name":m.display_name,"provider":m.provider,"data_source":m.data_source} for m in db.scalars(select(Model).where(Model.data_source=="demo").order_by(Model.display_name))]
+    if mode!="live":raise HTTPException(400,"Only live provider models are available")
     for provider,model_id,label in available_live_models():
         mid=f"live:{provider}:{model_id}"; m=db.get(Model,mid)
         if not m: m=Model(id=mid,provider=provider,display_name=label,model_id=model_id,data_source="live");db.add(m);db.commit()
-        available.append({"id":mid,"name":label,"provider":provider,"data_source":"live"})
-    return available
+    return [{"id":m.id,"name":m.display_name,"provider":m.provider,"data_source":m.data_source} for m in db.scalars(select(Model).where(Model.data_source=="live").order_by(Model.display_name))]
 @app.get("/api/providers")
 def providers():
     return {"configured":configured_providers(),"models":[{"provider":provider,"id":model_id,"name":label} for provider,model_id,label in available_live_models()],"search_supported":False,"pricing_configured":False}
 @app.get("/api/prompts")
 def prompts(domain:str|None=None,db:Session=Depends(get_db)):
-    q=select(Prompt).order_by(Prompt.domain,Prompt.id)
+    q=select(Prompt).where(Prompt.is_custom==True).order_by(Prompt.domain,Prompt.id)
     if domain:q=q.where(Prompt.domain==domain)
+    if APP_MODE=="demo": q=select(Prompt).order_by(Prompt.domain,Prompt.id)
     return [{"id":p.id,"text":p.text,"domain":p.domain,"group_id":p.group_id,"variant":p.variant,"custom":p.is_custom} for p in db.scalars(q)]
 @app.post("/api/prompts")
 def create_prompt(body:PromptIn,db:Session=Depends(get_db)):
@@ -76,15 +78,16 @@ def create_prompt(body:PromptIn,db:Session=Depends(get_db)):
     p=Prompt(id=uid("prompt"),text=body.text,domain=body.domain,is_custom=True,variant="custom")
     db.add(p);db.commit();return {"id":p.id,"text":p.text,"domain":p.domain,"custom":True}
 @app.get("/api/experiments")
-def experiments(db:Session=Depends(get_db)):
-    return [{"id":e.id,"name":e.name,"domain":e.domain,"mode":e.mode,"status":e.status,"created_at":e.created_at.isoformat() if e.created_at else None} for e in db.scalars(select(Experiment).order_by(desc(Experiment.created_at)))]
+def experiments(mode:str|None=None,db:Session=Depends(get_db)):
+    selected_mode=mode or APP_MODE
+    return [{"id":e.id,"name":e.name,"domain":e.domain,"mode":e.mode,"status":e.status,"created_at":e.created_at.isoformat() if e.created_at else None} for e in db.scalars(select(Experiment).where(Experiment.mode==selected_mode).order_by(desc(Experiment.created_at)))]
 @app.post("/api/experiments")
 def create_experiment(body:ExperimentIn,db:Session=Depends(get_db)):
     if body.domain not in DOMAINS:raise HTTPException(400,"Unsupported consumer domain")
-    if body.mode not in {"demo","live"}:raise HTTPException(400,"Mode must be demo or live")
+    if body.mode not in ({"live","demo"} if APP_MODE=="demo" else {"live"}):raise HTTPException(400,"Only live provider experiments are supported")
     if any(not db.get(Model,m) for m in body.model_ids):raise HTTPException(400,"Unknown model")
-    expected="demo" if body.mode=="demo" else "live"
-    if any(db.get(Model,m).data_source!=expected for m in body.model_ids):raise HTTPException(400,"Do not combine demo and live model selections")
+    expected=body.mode
+    if any(db.get(Model,m).data_source!=expected for m in body.model_ids):raise HTTPException(400,"Do not mix provider and demo models")
     if body.mode=="live" and body.search_enabled:raise HTTPException(400,"Search-enabled execution is not currently exposed by these provider adapters")
     if any(not db.get(Prompt,p) or db.get(Prompt,p).domain!=body.domain for p in body.prompt_ids):raise HTTPException(400,"Prompt must exist and match selected domain")
     e=Experiment(id=uid("exp"),name=body.name,description=body.description,domain=body.domain,mode=body.mode,config={"model_ids":body.model_ids,"prompt_ids":body.prompt_ids,"repetitions":body.repetitions,"search_enabled":body.search_enabled,"version":1},status="created")
@@ -99,13 +102,15 @@ def experiment_detail(experiment_id:str,db:Session=Depends(get_db)):
 def run_experiment(experiment_id:str,body:RunIn=RunIn(),db:Session=Depends(get_db)):
     e=db.get(Experiment,experiment_id)
     if not e:raise HTTPException(404,"Experiment not found")
-    if e.mode=="live":
+    if e.mode=="demo":
+        if APP_MODE!="demo":raise HTTPException(400,"Demo execution is disabled; use a live provider experiment")
+        run=demo_run(db,e)
+    else:
         if not body.confirm_live_cost_unavailable:raise HTTPException(400,"Live requests may incur provider charges. Pricing is not configured; explicit confirmation is required.")
         for mid in e.config["model_ids"]:
             model=db.get(Model,mid)
             if not configured_providers().get(model.provider):raise HTTPException(400,f"Missing {model.provider} API key")
         run=live_run(db,e)
-    else:run=demo_run(db,e)
     finished_at=run.completed_at;started_at=run.started_at
     if finished_at and started_at:
         if finished_at.tzinfo is None:finished_at=finished_at.replace(tzinfo=timezone.utc)
@@ -146,7 +151,7 @@ def run_detail(run_id:str,db:Session=Depends(get_db)):
     if not r:raise HTTPException(404,"Run not found")
     return {"id":r.id,"status":r.status,"planned":r.planned,"completed":r.completed,"failed":r.failed,"started_at":r.started_at.isoformat()}
 @app.get("/api/responses")
-def responses(source:str="demo",model:str|None=None,domain:str|None=None,brand_id:str|None=None,search:str|None=None,start:datetime|None=None,end:datetime|None=None,limit:int=Query(100,le=500),offset:int=0,db:Session=Depends(get_db)):
+def responses(source:str="live",model:str|None=None,domain:str|None=None,brand_id:str|None=None,search:str|None=None,start:datetime|None=None,end:datetime|None=None,limit:int=Query(100,le=500),offset:int=0,db:Session=Depends(get_db)):
     q=select(LLMResponse).where(LLMResponse.data_source==source)
     if model:q=q.where(LLMResponse.model_id==model)
     if domain:q=q.join(Experiment,Experiment.id==LLMResponse.experiment_id).where(Experiment.domain==domain)
@@ -165,9 +170,9 @@ def response_detail(response_id:str,db:Session=Depends(get_db)):
 @app.get("/api/analytics/model-comparison")
 @app.get("/api/analytics/historical-trends")
 @app.get("/api/analytics/prompt-sensitivity")
-def analytics_endpoint(source:str="demo",domain:str|None=None,model:str|None=None,brand_id:str|None=None,db:Session=Depends(get_db)):return analytics(db,source,domain,model,brand_id=brand_id)
+def analytics_endpoint(source:str="live",domain:str|None=None,model:str|None=None,brand_id:str|None=None,db:Session=Depends(get_db)):return analytics(db,source,domain,model,brand_id=brand_id)
 @app.get("/api/analytics/drift-alerts")
-def drift(source:str="demo",domain:str|None=None,model:str|None=None,db:Session=Depends(get_db)):
+def drift(source:str="live",domain:str|None=None,model:str|None=None,db:Session=Depends(get_db)):
     now=datetime.now(timezone.utc);cut=now-timedelta(days=14)
     previous=analytics(db,source,domain,model,now-timedelta(days=28),cut)
     recent=analytics(db,source,domain,model,cut,now)
@@ -180,13 +185,13 @@ def drift(source:str="demo",domain:str|None=None,model:str|None=None,db:Session=
             changes.append({"brand":name,"previous_rate":old["rate"],"recent_rate":new["rate"],"difference":delta,"previous_n":previous["denominator"],"recent_n":recent["denominator"],"source":source,"window_days":14})
     return sorted(changes,key=lambda x:abs(x["difference"]),reverse=True)
 @app.get("/api/quality/summary")
-def quality(source:str="demo",db:Session=Depends(get_db)):
+def quality(source:str="live",db:Session=Depends(get_db)):
     total=db.scalar(select(func.count(BrandObservation.id)).join(LLMResponse).where(LLMResponse.data_source==source,LLMResponse.execution_status=="success")) or 0
     pending=db.scalar(select(func.count(BrandObservation.id)).join(LLMResponse).where(BrandObservation.reviewed==False,LLMResponse.data_source==source,LLMResponse.execution_status=="success")) or 0
     failed=db.scalar(select(func.count(LLMResponse.id)).where(LLMResponse.execution_status=="failed",LLMResponse.data_source==source)) or 0
     return {"observations":total,"pending_review":pending,"responses_failed":failed}
 @app.get("/api/quality/review-queue")
-def review_queue(source:str="demo",limit:int=100,db:Session=Depends(get_db)):
+def review_queue(source:str="live",limit:int=100,db:Session=Depends(get_db)):
     rows=db.execute(select(BrandObservation,LLMResponse,Brand).join(LLMResponse).join(Brand).where(BrandObservation.reviewed==False,LLMResponse.data_source==source,LLMResponse.execution_status=="success").limit(min(limit,500))).all()
     return [{"id":o.id,"brand":b.canonical_name,"evidence":o.evidence,"sentiment":o.sentiment,"response_id":r.id} for o,r,b in rows]
 @app.post("/api/quality/annotations")
@@ -196,7 +201,7 @@ def annotate(body:AnnotationIn,db:Session=Depends(get_db)):
     a=Annotation(id=uid("ann"),observation_id=o.id,corrected_sentiment=body.sentiment,corrected_rank=body.rank,note=body.note)
     o.reviewed=True; db.add(a); db.commit();return {"id":a.id,"observation_id":o.id,"saved":True}
 @app.get("/api/system/metrics")
-def metrics(source:str="demo",model:str|None=None,start:datetime|None=None,end:datetime|None=None,db:Session=Depends(get_db)):
+def metrics(source:str="live",model:str|None=None,start:datetime|None=None,end:datetime|None=None,db:Session=Depends(get_db)):
     q=select(LLMResponse).where(LLMResponse.data_source==source)
     if model:q=q.where(LLMResponse.model_id==model)
     if start:q=q.where(LLMResponse.timestamp>=start)

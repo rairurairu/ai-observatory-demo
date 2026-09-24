@@ -41,6 +41,29 @@ def stable_id(value): return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10
 def init_db():
     Base.metadata.create_all(bind=engine)
 
+def seed_reference_catalog():
+    """Ensure brand entities exist without generating synthetic responses."""
+    init_db()
+    db=SessionLocal()
+    try:
+        for domain,names in DOMAINS.items():
+            for name in names:
+                bid="brand-"+re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                if not db.get(Brand,bid): db.add(Brand(id=bid,canonical_name=name,domain=domain,aliases=ALIASES.get(name,[]),products=PRODUCTS[name]))
+        db.commit()
+        for domain,names in DOMAINS.items():
+            for name in names:
+                bid="brand-"+re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                for alias in ALIASES.get(name,[]):
+                    if not db.scalar(select(BrandAlias).where(BrandAlias.alias==alias)):
+                        db.add(BrandAlias(id=uid("alias"),brand_id=bid,alias=alias))
+                for product_name in PRODUCTS[name]:
+                    if not db.scalar(select(Product).where(Product.brand_id==bid,Product.canonical_name==product_name)):
+                        db.add(Product(id=uid("product"),brand_id=bid,canonical_name=product_name,product_family=product_name.split()[0]))
+        db.commit()
+    finally:
+        db.close()
+
 def _seed_catalog(db: Session):
     if not db.get(Model, "model-a"):
         db.add_all([Model(id=i, provider="demo", display_name=n, model_id=n, data_source="demo") for i,n in MODELS])
@@ -241,7 +264,7 @@ def response_dict(r: LLMResponse, db: Session):
         out.append({"id":o.id,"brand_id":o.brand_id,"brand":db.get(Brand,o.brand_id).canonical_name,"mention_order":o.mention_order,"explicit_rank":o.explicit_rank,"product":o.product,"sentiment":o.sentiment,"attributes":o.attributes,"evidence":o.evidence,"reviewed":o.reviewed,"human_annotations":[{"sentiment":a.corrected_sentiment,"rank":a.corrected_rank,"note":a.note,"created_at":a.created_at.isoformat() if a.created_at else None} for a in annotations]})
     return {"id":r.id,"experiment_id":r.experiment_id,"run_id":r.run_id,"prompt_id":r.prompt_id,"prompt":p.text if p else "","model_id":r.model_id,"model":m.display_name if m else r.model_id,"timestamp":r.timestamp.isoformat() if r.timestamp else None,"response_text":r.response_text,"token_usage":r.token_usage,"latency_ms":r.latency_ms,"execution_status":r.execution_status,"error_message":r.error_message,"data_source":r.data_source,"model_configuration":r.model_configuration,"search_enabled":r.search_enabled,"observations":out}
 
-def analytics(db: Session, source="demo", domain=None, model=None, start=None, end=None, brand_id=None):
+def analytics(db: Session, source="live", domain=None, model=None, start=None, end=None, brand_id=None):
     q=select(LLMResponse).where(LLMResponse.data_source==source)
     if domain: q=q.join(Experiment,Experiment.id==LLMResponse.experiment_id).where(Experiment.domain==domain)
     if model: q=q.where(LLMResponse.model_id==model)
